@@ -329,18 +329,56 @@ def _fetch_page_text(url: str) -> str:
         return ""
 
 
+def _ddgs_text(query: str, max_results: int) -> list[dict[str, Any]]:
+    """Try a few keyless backends; retry once on empty/transient errors."""
+    backends: list[str | None] = [None, "duckduckgo", "bing"]
+    last_err: Exception | None = None
+    for attempt in range(2):
+        for backend in backends:
+            try:
+                kwargs: dict[str, Any] = {
+                    "region": "ru-ru",
+                    "max_results": max_results,
+                }
+                if backend:
+                    kwargs["backend"] = backend
+                with DDGS() as ddgs:
+                    raw = list(ddgs.text(query, **kwargs))
+                if raw:
+                    return raw
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                continue
+        if attempt == 0:
+            time.sleep(0.6)
+    if last_err:
+        raise last_err
+    return []
+
+
 def web_search(query: str, max_results: int = WEB_RESULTS) -> list[dict[str, Any]]:
-    """Keyless DuckDuckGo search via ddgs; optionally fetch page snippets."""
+    """Keyless DuckDuckGo/Bing search via ddgs; optionally fetch page snippets."""
     results: list[dict[str, Any]] = []
     try:
-        with DDGS() as ddgs:
-            raw = list(ddgs.text(query, region="ru-ru", max_results=max_results))
+        raw = _ddgs_text(query, max_results)
     except Exception as exc:  # noqa: BLE001
         return [
             {
                 "title": "Ошибка поиска",
                 "url": "",
+                "host": "",
                 "snippet": f"Веб-поиск недоступен: {exc}",
+                "text": "",
+            }
+        ]
+
+    if not raw:
+        return [
+            {
+                "title": "Поиск без результатов",
+                "url": "",
+                "host": "",
+                "snippet": "Поисковик не вернул ссылок. Можно переформулировать вопрос.",
                 "text": "",
             }
         ]
@@ -497,15 +535,21 @@ def _build_prompt(
         )
     web_ctx = "\n\n".join(web_blocks) if web_blocks else "(веб-результаты пусты)"
 
-    mode_note = (
-        "Доступны и локальные документы, и результаты из интернета. "
-        "Если вопрос про интернет/актуальные данные — опирайся на веб. "
-        "Если вопрос про локальные файлы пользователя — опирайся на документы. "
-        "Можно комбинировать."
-        if used_web
-        else "Интернет выключен. Отвечай только по локальным документам; "
-        "если данных нет — честно скажи, что в документах этого нет."
-    )
+    if used_web:
+        mode_note = (
+            "У тебя ЕСТЬ доступ к интернету через встроенный веб-поиск этого приложения. "
+            "Если спрашивают, можешь ли ты грузить/искать в интернете — ответь ДА: "
+            "поиск уже выполнен (см. блок ВЕБ), цитируй URL. "
+            "Не говори, что ты offline-only или docs-only. "
+            "Для вопросов про локальные файлы опирайся на ДОКУМЕНТЫ; для сети — на ВЕБ. "
+            "Можно комбинировать."
+        )
+    else:
+        mode_note = (
+            "Интернет выключен переключателем. Отвечай только по локальным документам; "
+            "если данных нет — честно скажи, что в документах этого нет, "
+            "и предложи включить «Интернет»."
+        )
 
     return (
         "Ты локальный помощник на этом Mac.\n"
@@ -513,7 +557,6 @@ def _build_prompt(
         "весь ответ должен быть по-русски. ЗАПРЕЩЕНО писать иероглифы, китайский, японский "
         "или любой перевод на другие языки. Никаких bilingual dump.\n"
         f"{mode_note}\n"
-        "Не утверждай, что у тебя нет интернета, если ниже есть блок ВЕБ.\n"
         "Кратко и точно. Указывай номера источников [Д1]/[В1] где уместно.\n\n"
         f"ДОКУМЕНТЫ:\n{docs_ctx}\n\n"
         f"ВЕБ:\n{web_ctx if used_web else '(не использовался)'}\n\n"
